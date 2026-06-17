@@ -339,6 +339,77 @@ def sample_random_requests(
     return input_requests
 
 
+def _default_fill_prompt_path(isl: int, num_prompts: int, seed: int) -> str:
+    return f"fill-kv-cache-isl{isl}-num-prompts{num_prompts}-seed{seed}.json"
+
+
+def save_fill_prompt_dataset(
+    path: str,
+    input_requests: List[Tuple[str, int, int, Any]],
+    requested_isl: int,
+    model_id: str,
+    tokenizer_id: str,
+    seed: int,
+    use_chat_template: bool,
+    dsv4: bool,
+) -> None:
+    dataset = {
+        "version": 1,
+        "dataset": "fill-kv-cache",
+        "requested_isl": requested_isl,
+        "num_prompts": len(input_requests),
+        "model_id": model_id,
+        "tokenizer_id": tokenizer_id,
+        "seed": seed,
+        "use_chat_template": use_chat_template,
+        "dsv4": dsv4,
+        "requests": [
+            {
+                "prompt": prompt,
+                "isl": prompt_len,
+            }
+            for prompt, prompt_len, _, mm_content in input_requests
+            if mm_content is None
+        ],
+    }
+
+    if len(dataset["requests"]) != len(input_requests):
+        raise ValueError("Fill-prompt datasets do not support multi-modal prompts.")
+
+    with open(path, "w", encoding="utf-8") as outfile:
+        json.dump(dataset, outfile, ensure_ascii=False)
+
+
+def load_fill_prompt_requests(
+    path: str,
+    output_len: int,
+) -> List[Tuple[str, int, int, None]]:
+    with open(path, encoding="utf-8") as infile:
+        dataset = json.load(infile)
+
+    requests = dataset.get("requests")
+    if not isinstance(requests, list) or not requests:
+        raise ValueError(f"Invalid fill-prompt dataset: {path}")
+
+    input_requests: List[Tuple[str, int, int, None]] = []
+    for index, request in enumerate(requests):
+        if not isinstance(request, dict):
+            raise ValueError(
+                f"Invalid request at index {index} in fill-prompt dataset: "
+                f"{path}")
+
+        prompt = request.get("prompt")
+        isl = request.get("isl")
+        if not isinstance(prompt, str) or not isinstance(isl, int):
+            raise ValueError(
+                f"Each fill-prompt request must contain string 'prompt' and "
+                f"integer 'isl' fields. Bad index: {index}")
+
+        input_requests.append((prompt, isl, output_len, None))
+
+    return input_requests
+
+
 async def get_request(
     input_requests: List[Tuple[str, int, int]],
     request_rate: float,
@@ -827,14 +898,38 @@ def main(args: argparse.Namespace):
         trust_remote_code=args.trust_remote_code,
     )
 
+    if args.prefill_fill_kv_cache is not None and args.with_fill_prompt:
+        raise ValueError(
+            "--prefill-fill-kv-cache and --with-fill-prompt are mutually "
+            "exclusive.")
+    if (args.prefill_fill_kv_cache is not None
+            and args.prefill_fill_kv_cache <= 0):
+        raise ValueError("--prefill-fill-kv-cache ISL must be positive.")
+    if args.with_fill_prompt and args.random_output_len <= 0:
+        raise ValueError("--random-output-len must be positive with "
+                         "--with-fill-prompt.")
 
-    if args.dataset_name == "random":
+    if args.with_fill_prompt:
+        input_requests = load_fill_prompt_requests(
+            args.with_fill_prompt,
+            output_len=args.random_output_len,
+        )
+        print(
+            f"Loaded {len(input_requests)} fill prompts from "
+            f"{args.with_fill_prompt}; using output length "
+            f"{args.random_output_len}.")
+    elif args.dataset_name == "random":
+        is_prefill_run = args.prefill_fill_kv_cache is not None
+        random_input_len = (args.prefill_fill_kv_cache
+                            if is_prefill_run else args.random_input_len)
+        random_output_len = 1 if is_prefill_run else args.random_output_len
+        random_range_ratio = 1.0 if is_prefill_run else args.random_range_ratio
         input_requests = sample_random_requests(
             prefix_len=args.random_prefix_len,
-            input_len=args.random_input_len,
-            output_len=args.random_output_len,
+            input_len=random_input_len,
+            output_len=random_output_len,
             num_prompts=args.num_prompts,
-            range_ratio=args.random_range_ratio,
+            range_ratio=random_range_ratio,
             tokenizer=tokenizer,
             use_chat_template=args.use_chat_template,
             dsv4=args.dsv4,
@@ -843,6 +938,21 @@ def main(args: argparse.Namespace):
             trust_remote_code=args.trust_remote_code,
             num_workers=args.random_num_workers,
         )
+        if is_prefill_run:
+            fill_prompt_path = (
+                args.dataset_path or _default_fill_prompt_path(
+                    args.prefill_fill_kv_cache, args.num_prompts, args.seed))
+            save_fill_prompt_dataset(
+                path=fill_prompt_path,
+                input_requests=input_requests,
+                requested_isl=args.prefill_fill_kv_cache,
+                model_id=model_id,
+                tokenizer_id=tokenizer_id,
+                seed=args.seed,
+                use_chat_template=args.use_chat_template,
+                dsv4=args.dsv4,
+            )
+            print(f"Saved fill-prompt dataset to {fill_prompt_path}")
 
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
@@ -890,7 +1000,7 @@ def main(args: argparse.Namespace):
         result_json["model_id"] = model_id
         result_json["tokenizer_id"] = tokenizer_id
         result_json["best_of"] = args.best_of
-        result_json["num_prompts"] = args.num_prompts
+        result_json["num_prompts"] = len(input_requests)
 
         # Metadata
         if args.metadata:
@@ -940,12 +1050,12 @@ def main(args: argparse.Namespace):
 
     max_failure_rate = 0.05
     completed = benchmark_result["completed"]
-    failure_rate = 1 - completed / args.num_prompts
+    failure_rate = 1 - completed / len(input_requests)
     if failure_rate > max_failure_rate:
         raise SystemExit(
             f"FAIL: request failure rate {failure_rate:.1%} exceeds "
             f"{max_failure_rate:.0%} threshold "
-            f"({completed}/{args.num_prompts} completed)"
+            f"({completed}/{len(input_requests)} completed)"
         )
 
 
@@ -984,7 +1094,27 @@ if __name__ == "__main__":
                         type=str,
                         default=None,
                         help="Path to the sharegpt/sonnet dataset. "
-                        "Or the huggingface dataset ID if using HF dataset.")
+                        "Or the huggingface dataset ID if using HF dataset. "
+                        "When --prefill-fill-kv-cache is set, this is the "
+                        "path where the generated fill-prompt JSON is saved.")
+    parser.add_argument(
+        "--prefill-fill-kv-cache",
+        metavar="ISL",
+        type=int,
+        default=None,
+        help="Generate a random fill-prompt dataset with ISL input tokens, "
+        "save it as JSON, and send the prompts with output length 1 to "
+        "prefill backend KV cache.",
+    )
+    parser.add_argument(
+        "--with-fill-prompt",
+        type=str,
+        default=None,
+        help="Path to a fill-prompt JSON generated by "
+        "--prefill-fill-kv-cache. The prompts and their JSON 'isl' values "
+        "are reused as benchmark inputs, while --random-output-len controls "
+        "the requested decode length.",
+    )
     parser.add_argument(
         "--max-concurrency",
         type=int,
